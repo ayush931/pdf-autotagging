@@ -4,7 +4,7 @@ Comprehensive schema for semantic elements, typography, table geometry, reading 
 """
 
 from enum import Enum
-from typing import List, Dict, Optional, Any, Union
+from typing import List, Dict, Optional, Any
 from pydantic import BaseModel, Field
 
 

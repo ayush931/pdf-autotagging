@@ -4,8 +4,19 @@ Builds PDF/UA XMP extension schemas, Dublin Core accessibility metadata,
 viewer preferences, language tags, and page tab order settings.
 """
 
-from typing import Optional
 from src.engine.models import DocumentMetadata
+
+
+def _xml_escape(value: str) -> str:
+    """Escapes XML-special characters so metadata cannot corrupt the XMP packet."""
+    return (
+        str(value)
+        .replace("&", "&amp;")
+        .replace("<", "&lt;")
+        .replace(">", "&gt;")
+        .replace('"', "&quot;")
+        .replace("'", "&apos;")
+    )
 
 
 class PDFUAMetadataBuilder:
@@ -18,10 +29,12 @@ class PDFUAMetadataBuilder:
         """
         Builds a compliant XMP packet with Dublin Core, Adobe PDF, and PDF/UA Extension Schemas.
         """
-        title = metadata.title or "Accessible Document"
-        author = metadata.author or "Antigravity PDF AutoTagger"
-        subject = metadata.subject or "Accessible Remediation"
-        lang = metadata.language or "en-US"
+        title = _xml_escape(metadata.title or "Accessible Document")
+        author = _xml_escape(metadata.author or "Antigravity PDF AutoTagger")
+        subject = _xml_escape(metadata.subject or "Accessible Remediation")
+        lang = _xml_escape(metadata.language or "en-US")
+        producer = _xml_escape(metadata.producer or "Antigravity PDF/UA AutoTagger Engine")
+        keywords = _xml_escape(", ".join(metadata.keywords))
 
         xmp_template = f"""<?xpacket begin="\ufeff" id="W5M0MpCehiHzreSzNTczkc9d"?>
 <x:xmpmeta xmlns:x="adobe:ns:meta/">
@@ -83,8 +96,8 @@ class PDFUAMetadataBuilder:
 
     <!-- Adobe PDF Schema -->
     <rdf:Description rdf:about="" xmlns:pdf="http://ns.adobe.com/pdf/1.3/">
-      <pdf:Producer>{metadata.producer}</pdf:Producer>
-      <pdf:Keywords>{", ".join(metadata.keywords)}</pdf:Keywords>
+      <pdf:Producer>{producer}</pdf:Producer>
+      <pdf:Keywords>{keywords}</pdf:Keywords>
     </rdf:Description>
 
   </rdf:RDF>

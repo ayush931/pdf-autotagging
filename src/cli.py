@@ -10,9 +10,7 @@ Usage:
 import os
 import sys
 import argparse
-import json
 import time
-from typing import List
 
 # Ensure UTF-8 stream handling
 if sys.platform == "win32":

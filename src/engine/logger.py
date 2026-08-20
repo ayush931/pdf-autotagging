@@ -5,9 +5,7 @@ Provides structured, clean logging with verbosity levels (QUIET, INFO, VERBOSE, 
 
 import sys
 import time
-import os
 from enum import IntEnum
-from typing import Optional
 
 # Ensure standard UTF-8 stream handling on Windows
 if sys.platform == "win32":

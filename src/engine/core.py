@@ -8,11 +8,9 @@ import os
 import time
 import shutil
 import tempfile
-from typing import Optional, Dict, Any, List
+from typing import Optional, Dict, Any
 
-from src.engine.models import (
-    AutoTaggingResult, DocumentMetadata, AccessibilityAuditReport, PageLayoutModel
-)
+from src.engine.models import AutoTaggingResult
 from src.engine.normalizer import PDFNormalizer
 from src.engine.layout_detector import LayoutDetector
 from src.engine.opendataloader_adapter import OpenDataLoaderAdapter
@@ -31,7 +29,7 @@ class AutoTaggingEngine:
     def __init__(
         self,
         ocr_enabled: bool = True,
-        use_opendataloader: bool = True,
+        use_opendataloader: bool = False,
         verbosity: Verbosity = Verbosity.NORMAL
     ):
         self.ocr_enabled = ocr_enabled
@@ -107,6 +105,10 @@ class AutoTaggingEngine:
                 )
                 if odl_result:
                     pages_layout, _ = odl_result
+                    # ODL may return an "empty" layout (e.g. scanned pages that
+                    # ODL could not parse); never leave the document untagged.
+                    if pages_layout and not any(p.elements for p in pages_layout):
+                        pages_layout = None
 
             # Fallback to native layout detector if needed
             if not pages_layout:
@@ -122,7 +124,7 @@ class AutoTaggingEngine:
             # Phase 3: Structure Tree & Low-Level PDF Tag Injection
             logger.phase("Phase 3: Marked Content Stream & Structure Tree Injection")
             logger.start_timer("p3")
-            self.tagger.tag_document(
+            final_output_path = self.tagger.tag_document(
                 repaired_pdf_path, output_pdf_path, pages_layout, metadata
             )
             p3_dur = logger.stop_timer("p3")
@@ -133,7 +135,7 @@ class AutoTaggingEngine:
             logger.phase("Phase 4: PDF/UA & WCAG Compliance Validation")
             logger.start_timer("p4")
             audit_report = self.validator.audit_pdf(
-                output_pdf_path, pages_layout, metadata
+                final_output_path, pages_layout, metadata
             )
             p4_dur = logger.stop_timer("p4")
             logger.success(f"Phase 4 complete in {p4_dur:.3f}s (Score: {audit_report.accessibility_score}%)")
@@ -143,7 +145,7 @@ class AutoTaggingEngine:
             return AutoTaggingResult(
                 success=True,
                 input_pdf_path=os.path.abspath(input_pdf_path),
-                output_pdf_path=os.path.abspath(output_pdf_path),
+                output_pdf_path=os.path.abspath(final_output_path),
                 audit_report=audit_report,
                 metadata=metadata,
                 pages=pages_layout,

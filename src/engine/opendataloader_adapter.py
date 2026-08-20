@@ -7,6 +7,7 @@ and PDF/UA accessibility auto-tagging.
 
 import os
 import json
+import re
 import tempfile
 import shutil
 from typing import List, Dict, Optional, Tuple, Any
@@ -14,8 +15,11 @@ import pymupdf as fitz
 
 from src.engine.models import (
     PageLayoutModel, SemanticElement, StandardTag, BoundingBox,
-    TableModel, TableCellModel, DocumentMetadata
+    TableModel, TableCellModel
 )
+from src.engine.reading_order import ReadingOrderEngine
+from src.engine.table_extractor import TableExtractor
+from src.engine.layout_detector import LayoutDetector
 from src.engine.logger import logger
 
 try:
@@ -59,7 +63,6 @@ class OpenDataLoaderAdapter:
         "table": StandardTag.TABLE,
         "image": StandardTag.FIGURE,
         "list": StandardTag.LI,
-        "regionlist": StandardTag.LI,
         "header": StandardTag.ARTIFACT,
         "footer": StandardTag.ARTIFACT,
         "caption": StandardTag.CAPTION,
@@ -69,12 +72,30 @@ class OpenDataLoaderAdapter:
 
     def __init__(self):
         self.available = HAS_OPENDATALOADER
+        self.reading_order_engine = ReadingOrderEngine()
+        self.table_extractor = TableExtractor()
+        self.layout_detector = LayoutDetector()
 
     def is_available(self) -> bool:
-        """Checks if OpenDataLoader library and Java runtime are operational."""
-        if not self.available:
-            return False
-        return True
+        """Checks if the OpenDataLoader library is installed (Java availability is only verified at runtime)."""
+        return self.available
+
+    @staticmethod
+    def _inside_bbox(inner: BoundingBox, outer: BoundingBox) -> bool:
+        """Returns True when inner box is inside or substantially overlaps outer box."""
+        ix0 = max(inner.x0, outer.x0)
+        iy0 = max(inner.y0, outer.y0)
+        ix1 = min(inner.x1, outer.x1)
+        iy1 = min(inner.y1, outer.y1)
+        if ix1 > ix0 and iy1 > iy0:
+            inter_area = (ix1 - ix0) * (iy1 - iy0)
+            inner_area = max(1.0, (inner.x1 - inner.x0) * (inner.y1 - inner.y0))
+            if (inter_area / inner_area) > 0.35:
+                return True
+        return (
+            inner.x0 >= outer.x0 - 5.0 and inner.x1 <= outer.x1 + 5.0 and
+            inner.y0 >= outer.y0 - 5.0 and inner.y1 <= outer.y1 + 5.0
+        )
 
     def extract_layout(
         self,
@@ -109,7 +130,6 @@ class OpenDataLoaderAdapter:
 
             base_name = os.path.splitext(os.path.basename(pdf_path))[0]
             json_file = os.path.join(temp_dir, f"{base_name}.json")
-            tagged_pdf_file = os.path.join(temp_dir, f"{base_name}_tagged.pdf")
 
             if not os.path.exists(json_file):
                 jsons = [os.path.join(temp_dir, f) for f in os.listdir(temp_dir) if f.endswith(".json")]
@@ -136,19 +156,87 @@ class OpenDataLoaderAdapter:
                 fitz_page = doc[p_idx]
                 page_w = float(fitz_page.rect.width)
                 page_h = float(fitz_page.rect.height)
+                raw_page_text = fitz_page.get_text().strip()
                 
-                page_kids = kids_by_page.get(p_idx, [])
+                # Check for Table of Contents page
+                is_toc_page = self.layout_detector._is_table_of_contents_page(raw_page_text, p_idx)
+                
                 elements: List[SemanticElement] = []
                 reading_order_ids: List[str] = []
 
-                for k_idx, kid in enumerate(page_kids):
-                    el = self._convert_kid_to_element(kid, p_idx, k_idx, page_w, page_h)
-                    if el:
-                        elements.append(el)
-                        reading_order_ids.append(el.id)
+                if is_toc_page:
+                    page_dict = fitz_page.get_text("dict")
+                    elements = self.layout_detector._extract_toc_page_elements(
+                        page_dict, p_idx, page_h, 10.5, 0
+                    )
+                else:
+                    page_kids = kids_by_page.get(p_idx, [])
+                    for k_idx, kid in enumerate(page_kids):
+                        if str(kid.get("type", "")).lower() == "list":
+                            for sub in self._convert_list_kid(kid, p_idx, k_idx, page_w, page_h):
+                                if sub:
+                                    elements.append(sub)
+                        else:
+                            el = self._convert_kid_to_element(kid, p_idx, k_idx, page_w, page_h)
+                            if el:
+                                elements.append(el)
 
-                # Normalize heading levels across the page
-                self._normalize_heading_levels(elements)
+                    # Complement with native TableExtractor if no table was found by ODL
+                    if not any(el.tag == StandardTag.TABLE for el in elements):
+                        try:
+                            tables = self.table_extractor.extract_tables_from_page(pdf_path, p_idx, fitz_page)
+                            if tables:
+                                table_bboxes = [t.bbox for t in tables]
+                                elements = [
+                                    el for el in elements
+                                    if el.tag == StandardTag.FIGURE or not any(self._inside_bbox(el.bbox, tb) for tb in table_bboxes)
+                                ]
+                                for t_idx, tbl in enumerate(tables):
+                                    table_el = SemanticElement(
+                                        id=f"p{p_idx}_tbl_{len(elements)}",
+                                        tag=StandardTag.TABLE,
+                                        page_num=p_idx,
+                                        reading_order_index=len(elements),
+                                        bbox=tbl.bbox,
+                                        text="",
+                                        table_data=tbl
+                                    )
+                                    elements.append(table_el)
+                        except Exception:
+                            pass
+
+                # Complement with native raster images and vector drawing figures
+                try:
+                    page_dict = fitz_page.get_text("dict")
+                    text_blocks = [b for b in page_dict.get("blocks", []) if b.get("type") == 0]
+                    nat_figs, nat_arts = self.layout_detector._extract_page_graphics(
+                        fitz_page, p_idx, page_w, page_h, text_blocks
+                    )
+                    existing_fig_boxes = [el.bbox for el in elements if el.tag == StandardTag.FIGURE]
+                    for fig in nat_figs:
+                        if not any(self._inside_bbox(fig.bbox, eb) for eb in existing_fig_boxes):
+                            elements.append(fig)
+                    for art in nat_arts:
+                        elements.append(art)
+                except Exception:
+                    pass
+
+                # Ensure no non-table text elements overlap table bounding boxes
+                tbl_boxes = [el.bbox for el in elements if el.tag == StandardTag.TABLE]
+                if tbl_boxes:
+                    elements = [
+                        el for el in elements
+                        if el.tag in (StandardTag.TABLE, StandardTag.FIGURE)
+                        or not any(self._inside_bbox(el.bbox, tb) for tb in tbl_boxes)
+                    ]
+
+                # Enrich generic figure alt text with the contextual generator
+                # (ODL emits no alt text, so validators must see real content).
+                self._enrich_figure_alt_text(elements, p_idx)
+
+                # Order elements according to strict accessible reading order
+                elements = self.reading_order_engine.order_page_elements(elements, page_w, page_h)
+                reading_order_ids = [el.id for el in elements]
 
                 page_layout = PageLayoutModel(
                     page_num=p_idx,
@@ -162,15 +250,16 @@ class OpenDataLoaderAdapter:
                 )
                 pages_layout.append(page_layout)
 
+            # Document-wide heading hierarchy normalization
+            self.layout_detector._normalize_heading_hierarchy(pages_layout)
+
             doc.close()
             logger.verbose(f"OpenDataLoader successfully parsed {len(pages_layout)} pages with XY-Cut++ reading order.")
-            
-            final_tagged_pdf = None
-            if os.path.exists(tagged_pdf_file):
-                final_tagged_pdf = os.path.join(temp_dir, "odl_tagged_keep.pdf")
-                shutil.copyfile(tagged_pdf_file, final_tagged_pdf)
 
-            return pages_layout, final_tagged_pdf
+            # The second tuple element used to return an ODL-tagged PDF, but the
+            # file was deleted in the finally block before callers could use it.
+            # The engine tags natively, so no tagged-PDF path is returned.
+            return pages_layout, None
 
         except Exception as e:
             logger.warning(f"OpenDataLoader execution failed ({str(e)}), falling back to native layout detector.")
@@ -229,11 +318,11 @@ class OpenDataLoaderAdapter:
         else:
             bbox = BoundingBox(x0=0, y0=0, x1=page_w, y1=page_h)
 
-        # Do not allow non-figure / paragraph elements to cover the whole page
+        # Do not allow any element (including figures or paragraphs) to cover the whole page
         is_whole_page = (bbox.width >= page_w * 0.92 and bbox.height >= page_h * 0.85) or (
             bbox.x0 <= 5 and bbox.y0 <= 5 and bbox.x1 >= page_w - 5 and bbox.y1 >= page_h - 5
         )
-        if is_whole_page and tag != StandardTag.FIGURE:
+        if is_whole_page:
             return None
 
         text_content = kid.get("content") or kid.get("text") or ""
@@ -252,20 +341,27 @@ class OpenDataLoaderAdapter:
             if text_str and text_str[0] in ("•", "–", "—", "*", "-"):
                 list_label = text_str[0]
 
-        # Handle Table
+        # Handle Table. ODL emits table rows at the kid's top level ('rows'),
+        # not under a nested 'table' key; cells carry 'row span'/'column span'
+        # (with spaces), a 'pdfua_tag' of TH/TD, and their text lives in the
+        # nested kids[].content.
         table_data = None
-        if tag == StandardTag.TABLE and "table" in kid:
-            raw_table = kid["table"]
-            table_rows = raw_table.get("rows", [])
+        if tag == StandardTag.TABLE:
+            raw_table = kid.get("table") or kid
+            table_rows = raw_table.get("rows", []) or []
             cells: List[TableCellModel] = []
-            
+
             for r_idx, row in enumerate(table_rows):
-                for c_idx, cell in enumerate(row.get("cells", [])):
-                    c_text = cell.get("content") or cell.get("text") or ""
-                    is_th = bool(cell.get("is_header", r_idx == 0))
-                    scope = "Column" if (r_idx == 0) else ("Row" if is_th else None)
+                for c_idx, cell in enumerate(row.get("cells", []) or []):
+                    cell_tag = str(cell.get("pdfua_tag", ""))
+                    c_text = ""
+                    for sub in cell.get("kids", []) or []:
+                        c_text += str(sub.get("content") or sub.get("text") or "")
+                    c_text = c_text.strip()
+                    is_th = bool(cell.get("is_header", cell_tag == "TH" or r_idx == 0))
+                    scope = "Column" if (r_idx == 0 or cell_tag == "TH") else ("Row" if is_th else None)
                     c_box = cell.get("bounding box", [raw_box[0], raw_box[1], raw_box[2], raw_box[3]])
-                    
+
                     if len(c_box) == 4:
                         c_top_y0 = max(0.0, page_h - max(float(c_box[1]), float(c_box[3])))
                         c_top_y1 = min(page_h, page_h - min(float(c_box[1]), float(c_box[3])))
@@ -273,25 +369,32 @@ class OpenDataLoaderAdapter:
                     else:
                         cell_bbox = bbox
 
+                    try:
+                        row_span = int(cell.get("row span", cell.get("row_span", 1)))
+                        col_span = int(cell.get("column span", cell.get("col_span", 1)))
+                    except (TypeError, ValueError):
+                        row_span = col_span = 1
+
                     cells.append(TableCellModel(
                         row_index=r_idx,
                         col_index=c_idx,
-                        row_span=cell.get("row_span", 1),
-                        col_span=cell.get("col_span", 1),
+                        row_span=max(1, row_span),
+                        col_span=max(1, col_span),
                         is_header=is_th,
                         header_scope=scope,
                         text=c_text,
                         bbox=cell_bbox
                     ))
 
-            table_data = TableModel(
-                bbox=bbox,
-                rows_count=len(table_rows),
-                cols_count=max((len(r.get("cells", [])) for r in table_rows), default=1),
-                cells=cells,
-                has_headers=any(c.is_header for c in cells),
-                summary=f"Table on page {page_idx + 1}"
-            )
+            if cells:
+                table_data = TableModel(
+                    bbox=bbox,
+                    rows_count=len(table_rows),
+                    cols_count=max((len(r.get("cells", []) or []) for r in table_rows), default=1),
+                    cells=cells,
+                    has_headers=any(c.is_header for c in cells),
+                    summary=f"Table on page {page_idx + 1}"
+                )
 
         return SemanticElement(
             id=f"p{page_idx}_odl_{k_idx}",
@@ -309,6 +412,114 @@ class OpenDataLoaderAdapter:
             list_label=list_label,
             table_data=table_data
         )
+
+    def _convert_list_kid(
+        self,
+        kid: Dict[str, Any],
+        page_idx: int,
+        k_idx: int,
+        page_w: float,
+        page_h: float
+    ) -> List[SemanticElement]:
+        """Converts an ODL list container into Lbl/LBody element pairs so the
+        tagger can build <L> -> <LI> -> <Lbl>/<LBody> structure."""
+        elements: List[SemanticElement] = []
+        raw_box = kid.get("bounding box", [0, 0, 100, 100])
+        if len(raw_box) == 4:
+            x0 = float(raw_box[0])
+            y0_raw = float(raw_box[1])
+            x1 = float(raw_box[2])
+            y1_raw = float(raw_box[3])
+            top_y0 = max(0.0, page_h - max(y0_raw, y1_raw))
+            top_y1 = min(page_h, page_h - min(y0_raw, y1_raw))
+            bbox = BoundingBox(x0=x0, y0=top_y0, x1=x1, y1=top_y1)
+        else:
+            bbox = BoundingBox(x0=0, y0=0, x1=page_w, y1=page_h)
+
+        items = kid.get("list items", []) or []
+        for li_idx, li in enumerate(items):
+            li_box = li.get("bounding box") or raw_box
+            if len(li_box) == 4:
+                lx0 = float(li_box[0])
+                ly0_raw = float(li_box[1])
+                lx1 = float(li_box[2])
+                ly1_raw = float(li_box[3])
+                li_bbox = BoundingBox(
+                    x0=lx0,
+                    y0=max(0.0, page_h - max(ly0_raw, ly1_raw)),
+                    x1=lx1,
+                    y1=min(page_h, page_h - min(ly0_raw, ly1_raw))
+                )
+            else:
+                li_bbox = bbox
+
+            text = (li.get("content") or "").strip()
+            if not text:
+                text = "".join(str(sub.get("content") or sub.get("text") or "") for sub in li.get("kids", []) or []).strip()
+            if not text:
+                continue
+
+            marker_match = re.match(r'^([\u2022\u2013\u2014*\-]|\d{1,3}[.)])\s*(.*)$', text, re.DOTALL)
+            if not marker_match:
+                elements.append(SemanticElement(
+                    id=f"p{page_idx}_odl_{k_idx}_li{li_idx}",
+                    tag=StandardTag.LBODY,
+                    page_num=page_idx,
+                    reading_order_index=k_idx,
+                    bbox=li_bbox,
+                    text=text,
+                    font_size=li.get("font size")
+                ))
+                continue
+
+            label_str = marker_match.group(1)
+            body_text = (marker_match.group(2) or "").strip()
+            font_size = li.get("font size") or 10.0
+            try:
+                font_size = float(font_size)
+            except (TypeError, ValueError):
+                font_size = 10.0
+            label_width = max(10.0, font_size * 0.9, len(label_str) * font_size * 0.55)
+            lbl_bbox = BoundingBox(
+                x0=li_bbox.x0, y0=li_bbox.y0,
+                x1=min(li_bbox.x1, li_bbox.x0 + label_width), y1=li_bbox.y1
+            )
+            body_bbox = BoundingBox(
+                x0=min(li_bbox.x1, li_bbox.x0 + label_width), y0=li_bbox.y0,
+                x1=li_bbox.x1, y1=li_bbox.y1
+            )
+            elements.append(SemanticElement(
+                id=f"p{page_idx}_odl_{k_idx}_lbl{li_idx}",
+                tag=StandardTag.LBL,
+                page_num=page_idx,
+                reading_order_index=k_idx,
+                bbox=lbl_bbox,
+                text=label_str,
+                list_label=label_str,
+                font_size=font_size
+            ))
+            elements.append(SemanticElement(
+                id=f"p{page_idx}_odl_{k_idx}_lbody{li_idx}",
+                tag=StandardTag.LBODY,
+                page_num=page_idx,
+                reading_order_index=k_idx,
+                bbox=body_bbox,
+                text=body_text,
+                list_label=label_str,
+                font_size=font_size
+            ))
+        return elements
+
+    def _enrich_figure_alt_text(self, elements: List[SemanticElement], page_idx: int):
+        """Replaces generic figure alt placeholders with contextual descriptions."""
+        try:
+            from src.engine.alt_text_gen import AltTextGenerator
+            gen = AltTextGenerator()
+            for el in elements:
+                if el.tag == StandardTag.FIGURE and (not el.alt_text or gen._is_generic_placeholder(el.alt_text)):
+                    el.alt_text = gen.generate_alt_text(el, elements, None)
+        except Exception:
+            pass
 
     def _normalize_heading_levels(self, elements: List[SemanticElement]):
         """Normalizes heading hierarchy to eliminate skipped levels."""

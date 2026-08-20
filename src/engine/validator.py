@@ -5,7 +5,7 @@ guaranteeing 100% Error and Warning-Free compliance in PAC 2024, Adobe Preflight
 """
 
 import pikepdf
-from pikepdf import Name, Dictionary, Array, Operator
+from pikepdf import Name, Operator
 from typing import List, Dict, Tuple, Any
 from src.engine.models import (
     AccessibilityAuditReport, AuditIssue, AuditSeverity,
@@ -63,7 +63,8 @@ class AccessibilityValidator:
 
         # 1. Document Catalog & Structure Tree Checks
         # 1.1 Marked PDF Check (Matterhorn 01-001)
-        is_marked = "/MarkInfo" in pdf.Root and bool(pdf.Root.MarkInfo.get("/Marked", False))
+        mark_info = pdf.Root.get("/MarkInfo") if "/MarkInfo" in pdf.Root else None
+        is_marked = isinstance(mark_info, pikepdf.Dictionary) and bool(mark_info.get("/Marked", False))
         if not is_marked:
             issues.append(AuditIssue(
                 rule_id="PDFUA-01-001",
@@ -146,6 +147,7 @@ class AccessibilityValidator:
 
         # 1.5 XMP Metadata Stream Check (Matterhorn 01-008 & 01-009)
         has_metadata = "/Metadata" in pdf.Root
+        has_pdfuaid = False
         if not has_metadata:
             issues.append(AuditIssue(
                 rule_id="PDFUA-01-008",
@@ -157,8 +159,11 @@ class AccessibilityValidator:
                 status="FAIL"
             ))
         else:
-            xmp_str = pdf.Root.Metadata.read_bytes().decode("utf-8", errors="ignore")
-            has_pdfuaid = ("pdfuaid:part" in xmp_str or "<pdfuaid:part>1</pdfuaid:part>" in xmp_str)
+            try:
+                xmp_str = pdf.Root.Metadata.read_bytes().decode("utf-8", errors="ignore")
+                has_pdfuaid = ("pdfuaid:part" in xmp_str or "<pdfuaid:part>1</pdfuaid:part>" in xmp_str)
+            except Exception:
+                has_pdfuaid = False
             if not has_pdfuaid:
                 issues.append(AuditIssue(
                     rule_id="PDFUA-01-009",
@@ -183,7 +188,8 @@ class AccessibilityValidator:
         # 1.6 Document Title Check (Matterhorn 13-001 to 13-004)
         doc_title = str(metadata.title or "").strip()
         has_info_title = pdf.docinfo and bool(pdf.docinfo.get("/Title"))
-        display_title = "/ViewerPreferences" in pdf.Root and bool(pdf.Root.ViewerPreferences.get("/DisplayDocTitle", False))
+        vp = pdf.Root.get("/ViewerPreferences") if "/ViewerPreferences" in pdf.Root else None
+        display_title = isinstance(vp, pikepdf.Dictionary) and bool(vp.get("/DisplayDocTitle", False))
 
         if not doc_title or doc_title.lower() == "untitled" or not has_info_title:
             issues.append(AuditIssue(
@@ -228,7 +234,9 @@ class AccessibilityValidator:
             ))
 
         # 1.7 Natural Language Check (Matterhorn 14-001)
-        lang = str(pdf.Root.get("/Lang", "") or metadata.language or "").strip()
+        # PDF/UA requires /Lang on the Catalog; falling back to metadata would
+        # mask a genuine violation.
+        lang = str(pdf.Root.get("/Lang", "") or "").strip()
         if not lang:
             issues.append(AuditIssue(
                 rule_id="PDFUA-14-001",
@@ -365,6 +373,29 @@ class AccessibilityValidator:
                 status="PASS"
             ))
 
+        # 2.4 Logical Reading Order / Meaningful Sequence Check (WCAG 2.1 SC 1.3.2)
+        has_reading_order = bool(pages_layout) and all(len(p.reading_order) > 0 for p in pages_layout if p.elements)
+        if has_reading_order:
+            issues.append(AuditIssue(
+                rule_id="WCAG-1.3.2",
+                standard="WCAG 2.1 AA",
+                clause="SC 1.3.2 Meaningful Sequence",
+                title="Logical Reading Order Preserved",
+                description="Elements are sequentially ordered via XY-Cut++ reading flow in the Structure Tree.",
+                severity=AuditSeverity.MAJOR,
+                status="PASS"
+            ))
+        else:
+            issues.append(AuditIssue(
+                rule_id="WCAG-1.3.2",
+                standard="WCAG 2.1 AA",
+                clause="SC 1.3.2 Meaningful Sequence",
+                title="Incomplete Reading Order",
+                description="One or more pages do not define a sequential reading order.",
+                severity=AuditSeverity.MAJOR,
+                status="FAIL"
+            ))
+
         # 3. Marked Content & ParentTree Integrity (Matterhorn 05-001 to 05-004, 04-001)
         stream_mcids_by_page: Dict[int, set] = {}
         unbalanced_pages: List[int] = []
@@ -396,8 +427,12 @@ class AccessibilityValidator:
         # Build the parent tree lookup: StructParents integer -> array of struct elements.
         parent_tree: Dict[int, Any] = {}
         nums = None
-        if "/ParentTree" in pdf.Root.StructTreeRoot:
-            nums = pdf.Root.StructTreeRoot.ParentTree.get("/Nums")
+        struct_root = pdf.Root.get("/StructTreeRoot") if "/StructTreeRoot" in pdf.Root else None
+        if struct_root is not None and "/ParentTree" in struct_root:
+            try:
+                nums = struct_root.get("/ParentTree").get("/Nums")
+            except Exception:
+                nums = None
         if nums is not None:
             try:
                 for i in range(0, len(nums), 2):
@@ -427,8 +462,8 @@ class AccessibilityValidator:
             ))
 
         # Collect every MCR (Pg, MCID) pair owned by the structure tree.
-        mcr_map: Dict[Tuple[str, int], int] = {}
         empty_struct_elems = 0
+        walk_failed = False
 
         def _walk_struct(obj, parent=None):
             nonlocal empty_struct_elems
@@ -440,9 +475,8 @@ class AccessibilityValidator:
                 return
             if obj.get("/Type") == Name("/MCR"):
                 mcid = obj.get("/MCID")
-                pg = obj.get("/Pg")
-                key = (str(pg) if pg is not None else "?", int(mcid))
-                mcr_map[key] = mcr_map.get(key, 0) + 1
+                if mcid is None:
+                    raise ValueError("MCR without /MCID")
                 return
             if obj.get("/Type") == Name("/StructElem"):
                 kids = obj.get("/K")
@@ -471,12 +505,25 @@ class AccessibilityValidator:
             if kids is not None:
                 _walk_struct(kids, obj)
 
+        struct_root = pdf.Root.get("/StructTreeRoot") if "/StructTreeRoot" in pdf.Root else None
         try:
-            _walk_struct(pdf.Root.StructTreeRoot.K)
-        except Exception:
-            pass
+            if struct_root is not None:
+                _walk_struct(struct_root.get("/K"))
+        except Exception as e:
+            walk_failed = True
+            logger.warning(f"Structure tree walk aborted: {e}")
 
-        if empty_struct_elems > 0:
+        if walk_failed:
+            issues.append(AuditIssue(
+                rule_id="PDFUA-04-001",
+                standard="PDF/UA-1",
+                clause="7.3 / Matterhorn 04-001",
+                title="Structure Tree Walk Failed",
+                description="The structure tree could not be fully walked; empty-structure analysis is incomplete.",
+                severity=AuditSeverity.MAJOR,
+                status="FAIL"
+            ))
+        elif empty_struct_elems > 0:
             issues.append(AuditIssue(
                 rule_id="PDFUA-04-001",
                 standard="PDF/UA-1",
@@ -502,6 +549,10 @@ class AccessibilityValidator:
                 for item in obj:
                     _collect_mcids(item, acc)
                 return
+            if isinstance(obj, (int, pikepdf.Integer)):
+                # Bare integer /K children are legal MCIDs (ISO 32000-1 14.7.4.4).
+                acc.add(int(obj))
+                return
             if not isinstance(obj, pikepdf.Dictionary):
                 return
             if obj.get("/Type") == Name("/MCR"):
@@ -519,7 +570,10 @@ class AccessibilityValidator:
         orphan_mcids = 0  # MCIDs owned by struct elements but missing from the page stream
         for p_idx, mcids in stream_mcids_by_page.items():
             page = pdf.pages[p_idx]
-            sp = int(page.get("/StructParents", -1))
+            try:
+                sp = int(page.get("/StructParents", -1))
+            except Exception:
+                sp = -1
             if sp not in parent_tree:
                 unresolved += len(mcids)
                 continue
@@ -581,17 +635,21 @@ class AccessibilityValidator:
         pass_count = sum(1 for iss in issues if iss.status == "PASS")
         fail_count = sum(1 for iss in issues if iss.status == "FAIL")
         total_evals = max(1, pass_count + fail_count)
-        
+
         critical_fails = sum(1 for iss in issues if iss.status == "FAIL" and iss.severity == AuditSeverity.CRITICAL)
         major_fails = sum(1 for iss in issues if iss.status == "FAIL" and iss.severity == AuditSeverity.MAJOR)
-        
+
         raw_score = (pass_count / total_evals) * 100.0
         if critical_fails > 0:
             raw_score = min(raw_score, 65.0)
-        
+
         accessibility_score = round(max(0.0, min(100.0, raw_score)), 1)
-        is_pdf_ua = (critical_fails == 0 and major_fails == 0 and has_struct_tree and is_marked and has_metadata)
-        is_wcag = (critical_fails == 0 and accessibility_score >= 90.0)
+        # PDF/UA conformance additionally requires the pdfuaid XMP marker.
+        is_pdf_ua = (critical_fails == 0 and major_fails == 0 and has_struct_tree and is_marked and has_metadata and has_pdfuaid)
+        # WCAG conformance requires NO failing WCAG check (any severity), not
+        # merely a high overall score.
+        wcag_fails = sum(1 for iss in issues if iss.status == "FAIL" and "WCAG" in iss.standard)
+        is_wcag = (critical_fails == 0 and wcag_fails == 0 and accessibility_score >= 90.0)
 
         pdf.close()
 

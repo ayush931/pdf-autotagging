@@ -4,7 +4,7 @@ Calculates relative luminance and contrast ratios between text glyphs and backgr
 """
 
 import math
-from typing import Tuple, Optional
+from typing import Tuple
 
 
 class ContrastChecker:
@@ -34,9 +34,10 @@ class ContrastChecker:
         gs = g / 255.0
         bs = b / 255.0
 
-        r_lin = rs / 12.92 if rs <= 0.04045 else math.pow((rs + 0.055) / 1.055, 2.4)
-        g_lin = gs / 12.92 if gs <= 0.04045 else math.pow((gs + 0.055) / 1.055, 2.4)
-        b_lin = bs / 12.92 if bs <= 0.04045 else math.pow((bs + 0.055) / 1.055, 2.4)
+        # WCAG 2.x linearization: threshold is 0.03928 (not 0.04045, which is sRGB)
+        r_lin = rs / 12.92 if rs <= 0.03928 else math.pow((rs + 0.055) / 1.055, 2.4)
+        g_lin = gs / 12.92 if gs <= 0.03928 else math.pow((gs + 0.055) / 1.055, 2.4)
+        b_lin = bs / 12.92 if bs <= 0.03928 else math.pow((bs + 0.055) / 1.055, 2.4)
 
         return 0.2126 * r_lin + 0.7152 * g_lin + 0.0722 * b_lin
 
@@ -54,7 +55,9 @@ class ContrastChecker:
         lighter = max(l1, l2)
         darker = min(l1, l2)
 
-        return round((lighter + 0.05) / (darker + 0.05), 2)
+        # Return the exact ratio; compliance comparison must use the unrounded
+        # value so a ratio of e.g. 4.496 does not round up to a false PASS at 4.5.
+        return (lighter + 0.05) / (darker + 0.05)
 
     @classmethod
     def check_compliance(cls, font_size: float, is_bold: bool, fg_hex: str, bg_hex: str = "#FFFFFF") -> Tuple[bool, float, float]:
@@ -64,4 +67,4 @@ class ContrastChecker:
         ratio = cls.calculate_contrast_ratio(fg_hex, bg_hex)
         is_large_text = font_size >= 18.0 or (font_size >= 14.0 and is_bold)
         required_ratio = 3.0 if is_large_text else 4.5
-        return (ratio >= required_ratio, ratio, required_ratio)
+        return (ratio >= required_ratio, round(ratio, 2), required_ratio)
