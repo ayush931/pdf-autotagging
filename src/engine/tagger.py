@@ -155,6 +155,8 @@ class PDFTagger:
         parent_tree_entries: List[Tuple[int, Any]] = []
         annot_parent_entries: List[Tuple[int, Any]] = []
         mupdf_doc = fitz.open(input_pdf_path)
+        self._list_stack = []
+        self._toc_stack = []
 
         for page_idx, page_model in enumerate(pages_layout):
             if page_idx >= len(pdf.pages):
@@ -195,6 +197,9 @@ class PDFTagger:
                 logger.verbose(f"Stream tagged: Page {page_idx + 1}/{total_pages} (Injected {page_mcid_count} MCIDs)")
 
         # 6. Finalize ParentTree (number tree /Nums)
+        # Prune empty structure elements with no MCID or child elements (Matterhorn 13-001)
+        self._prune_empty_struct_elements(doc_struct_elem)
+
         all_nums: List[Tuple[int, Any]] = []
         for sp, leaf_elems in parent_tree_entries:
             all_nums.append((sp, pdf.make_indirect(Array(leaf_elems))))
@@ -356,8 +361,13 @@ class PDFTagger:
                     if path_buffer:
                         path_buffer.append(op)
                     else:
-                        _close_group()
-                        _emit(op)
+                        # Don't close figure groups on Q - they span multiple
+                        # graphics state blocks for complex vector figures
+                        if active is not None and active.get("key") and isinstance(active["key"], tuple) and len(active["key"]) == 2 and active["key"][0] == "fig":
+                            _emit(op)
+                        else:
+                            _close_group()
+                            _emit(op)
                     continue
                 elif op_operator == Operator('cm') and len(op.operands) >= 6:
                     m = [float(x) for x in op.operands[:6]]
@@ -429,6 +439,35 @@ class PDFTagger:
                     items = self._split_text_op(op, tm, ctm, cur_font, cur_font_size,
                                                 resources, origin_x, origin_y, crop_h)
 
+                    def _advance_tm(text_op):
+                        nonlocal tm
+                        widths = self._font_widths(cur_font, resources) if cur_font else None
+                        total_tx = 0.0
+                        if text_op.operator in (Operator('Tj'), Operator("'"), Operator('"')):
+                            text_str = self._extract_op_text(text_op)
+                            if widths is not None:
+                                wmap, missing = widths
+                                target_raw = text_op.operands[0] if text_op.operator != Operator('"') else text_op.operands[2]
+                                for code in self._to_bytes(target_raw):
+                                    total_tx += wmap.get(code, missing) * cur_font_size / 1000.0
+                            else:
+                                total_tx += len(text_str) * 0.55 * cur_font_size
+                        elif text_op.operator == Operator('TJ') and text_op.operands:
+                            for item in text_op.operands[0]:
+                                if isinstance(item, (pikepdf.String, str)):
+                                    if widths is not None:
+                                        wmap, missing = widths
+                                        for code in self._to_bytes(item):
+                                            total_tx += wmap.get(code, missing) * cur_font_size / 1000.0
+                                    else:
+                                        total_tx += len(str(item)) * 0.55 * cur_font_size
+                                else:
+                                    try:
+                                        total_tx += -float(item) * cur_font_size / 1000.0
+                                    except Exception:
+                                        pass
+                        tm = self._matrix_mult([1.0, 0.0, 0.0, 1.0, total_tx, 0.0], tm)
+
                     # Whitespace-only text operators carry no content; keep them
                     # inside the current group when open, otherwise tag /Artifact
                     # instead of creating a bogus paragraph element.
@@ -440,6 +479,7 @@ class PDFTagger:
                                 ContentStreamInstruction([Name("/Artifact")], Operator("BMC")))
                             _emit(op)
                             new_stream_ops.append(ContentStreamInstruction([], Operator("EMC")))
+                        _advance_tm(op)
                         continue
 
                     # Resolve a target (artifact / link / table cell / element)
@@ -454,6 +494,13 @@ class PDFTagger:
                         nonlocal current
                         current = seg
                         segments.append(seg)
+
+                    op_full_text = self._extract_op_text(op).strip()
+                    op_matched_el = None
+                    if items and op_full_text:
+                        op_matched_el = self._find_matching_element(
+                            items[0][1], items[0][2], text_elements, op_full_text
+                        )
 
                     for text, cx, cy, arr_idx in items:
                         if not text.strip():
@@ -483,7 +530,11 @@ class PDFTagger:
                                 continue
 
                             # Find enclosing text element
-                            matched_el = self._find_matching_element(cx, cy, text_elements, text)
+                            matched_el = None
+                            if op_matched_el is not None and op_matched_el.tag not in (StandardTag.LBL, StandardTag.LBODY):
+                                matched_el = op_matched_el
+                            else:
+                                matched_el = self._find_matching_element(cx, cy, text_elements, text)
                             if matched_el is None:
                                 if (fallback_p is not None
                                         and abs(cy - fallback_line_y) < 20.0
@@ -549,7 +600,11 @@ class PDFTagger:
                             continue
 
                         # 4) Regular text element (P, H1-H6, Lbl, LBody, TOCI, Caption, etc.)
-                        matched_el = self._find_matching_element(cx, cy, text_elements, text)
+                        matched_el = None
+                        if op_matched_el is not None and op_matched_el.tag not in (StandardTag.LBL, StandardTag.LBODY):
+                            matched_el = op_matched_el
+                        else:
+                            matched_el = self._find_matching_element(cx, cy, text_elements, text)
                         if matched_el is None:
                             if (fallback_p is not None
                                     and abs(cy - fallback_line_y) < 20.0
@@ -613,6 +668,8 @@ class PDFTagger:
                         elif "el_id" in seg:
                             el_items.setdefault(seg["el_id"], []).append(("mcr", cur_mcid))
                         _emit(seg_op)
+
+                    _advance_tm(op)
 
                 # ---- Image showing operators ------------------------------------------
                 elif op_operator in self.image_ops:
@@ -683,11 +740,14 @@ class PDFTagger:
                         self._insert_in_reading_order(page_model, fig_el)
 
                     if fig_el is not None:
-                        cur_mcid = mcid
-                        _open_group("Figure", ("fig", fig_el.id))
-                        fig_mcids.setdefault(fig_el.id, []).append(cur_mcid)
-                        _emit(op)
-                        _close_group()
+                        group_key = ("fig", fig_el.id)
+                        if active is not None and active["key"] == group_key:
+                            _emit(op)
+                        else:
+                            cur_mcid = mcid
+                            _open_group("Figure", group_key)
+                            fig_mcids.setdefault(fig_el.id, []).append(cur_mcid)
+                            _emit(op)
                     else:
                         new_stream_ops.append(ContentStreamInstruction([Name("/Artifact")], Operator("BMC")))
                         _emit(op)
@@ -805,10 +865,6 @@ class PDFTagger:
         Returns the array of leaf structure elements corresponding to MCID 0..total_mcids-1.
         """
         page_leaf_elems: List[Any] = [None] * total_mcids
-
-        # Active structural containers
-        self._list_stack = []  # nested list stack: [{"parent", "kids", "level", "li", ...}]
-        self._toc_stack = []   # nested TOC stack: [{"parent", "kids", "level", "toci", ...}]
 
         # Process non-artifact elements in strict logical reading order
         sorted_elements = sorted(
@@ -953,7 +1009,7 @@ class PDFTagger:
 
                         self._append_items_to_parent(
                             pdf, pike_page, cell_elem, cell_kids, items,
-                            page_leaf_elems, total_mcids
+                            page_leaf_elems, total_mcids, annot_parents=annot_parents
                         )
 
                 for row_idx in sorted_row_idxs:
@@ -981,7 +1037,6 @@ class PDFTagger:
                         "/Type": Name("/StructElem"),
                         "/S": Name("/TOC"),
                         "/P": doc_struct_elem,
-                        "/Pg": pike_page.obj,
                         "/K": root_toc_kids
                     }))
                     doc_k_array.append(root_toc)
@@ -1001,7 +1056,6 @@ class PDFTagger:
                         "/Type": Name("/StructElem"),
                         "/S": Name("/TOC"),
                         "/P": sub_toc_parent,
-                        "/Pg": pike_page.obj,
                         "/K": sub_toc_kids
                     }))
                     if parent_entry.get("toci_kids") is not None:
@@ -1045,7 +1099,7 @@ class PDFTagger:
 
                 self._append_items_to_parent(
                     pdf, pike_page, ref_elem, ref_kids, items,
-                    page_leaf_elems, total_mcids
+                    page_leaf_elems, total_mcids, annot_parents=annot_parents
                 )
 
                 self._list_stack = []
@@ -1158,7 +1212,7 @@ class PDFTagger:
 
                 self._append_items_to_parent(
                     pdf, pike_page, leaf_elem, leaf_kids, items,
-                    page_leaf_elems, total_mcids
+                    page_leaf_elems, total_mcids, annot_parents=annot_parents
                 )
 
                 self._toc_stack = []
@@ -1202,12 +1256,12 @@ class PDFTagger:
 
                 self._append_items_to_parent(
                     pdf, pike_page, span_elem, span_kids, items,
-                    page_leaf_elems, total_mcids
+                    page_leaf_elems, total_mcids, annot_parents=annot_parents
                 )
             else:
                 self._append_items_to_parent(
                     pdf, pike_page, elem, elem_kids, items,
-                    page_leaf_elems, total_mcids
+                    page_leaf_elems, total_mcids, annot_parents=annot_parents
                 )
 
         # Fill any None slots in page_leaf_elems with a valid fallback
@@ -1302,6 +1356,27 @@ class PDFTagger:
                         page_leaf_elems[lm] = link_elem
 
                 i = j
+
+    def _prune_empty_struct_elements(self, node: Any) -> bool:
+        """Recursively removes empty structure elements with no MCID, OBJR, or non-empty child elements.
+        Returns True if node itself is non-empty and should be kept (Matterhorn Checkpoint 13-001)."""
+        if not hasattr(node, "get"):
+            return True
+        k = node.get("/K")
+        if k is None:
+            return False
+        if isinstance(k, pikepdf.Dictionary):
+            return True
+        if isinstance(k, pikepdf.Array):
+            pruned_kids = pikepdf.Array()
+            for kid in k:
+                if isinstance(kid, pikepdf.Dictionary) and kid.get("/Type") in (pikepdf.Name("/MCR"), pikepdf.Name("/OBJR")):
+                    pruned_kids.append(kid)
+                elif hasattr(kid, "get") and self._prune_empty_struct_elements(kid):
+                    pruned_kids.append(kid)
+            node["/K"] = pruned_kids
+            return len(pruned_kids) > 0
+        return True
 
     # ------------------------------------------------------------------ #
     # Helpers
@@ -1467,7 +1542,7 @@ class PDFTagger:
                     cx, cy = position(tx)
                     items.append((text, cx, cy, idx))
                     if widths is not None:
-                        raw = bytes(item)
+                        raw = self._to_bytes(item)
                         wmap, missing = widths
                         advance = 0.0
                         for code in raw:
@@ -1743,6 +1818,16 @@ class PDFTagger:
     })
 
     @staticmethod
+    def _to_bytes(val) -> bytes:
+        if isinstance(val, (bytes, bytearray)):
+            return bytes(val)
+        if isinstance(val, pikepdf.String):
+            return bytes(val)
+        if isinstance(val, str):
+            return val.encode('latin1', 'ignore')
+        return b''
+
+    @staticmethod
     def _normalize_link_text(s: str) -> str:
         return s.translate(PDFTagger._LIGATURE_MAP).strip().lower()
 
@@ -1750,10 +1835,10 @@ class PDFTagger:
         """Matches a stream text op to a link annotation by coordinate containment or line overlap."""
         if not links:
             return None
-        # 1. Coordinate containment inside link bounding box (with 3.5pt tolerance)
+        # 1. Coordinate containment inside link bounding box (with 5.0pt tolerance)
         for link in links:
             b = link["bbox"]
-            if (b[0] - 3.5) <= x <= (b[2] + 3.5) and (b[1] - 3.5) <= y <= (b[3] + 3.5):
+            if (b[0] - 5.0) <= x <= (b[2] + 5.0) and (b[1] - 4.5) <= y <= (b[3] + 4.5):
                 return link
         # 2. Line overlap matching: if text is on the same vertical line as a link
         norm = self._normalize_link_text(op_text) if op_text else ""
@@ -1764,11 +1849,11 @@ class PDFTagger:
                     # Check text equality or substring match for link texts
                     for raw_text in link["texts"]:
                         t = self._normalize_link_text(raw_text)
-                        if t and (t == norm or (len(t) >= 1 and (t in norm or norm in t))):
-                            if abs(x - b[0]) <= 35.0 or (b[0] - 5.0) <= x <= (b[2] + 5.0):
+                        if t and (t == norm or (len(norm) >= 3 and len(t) >= 3 and (t in norm or norm in t))):
+                            if abs(x - b[0]) <= 55.0 or (b[0] - 10.0) <= x <= (b[2] + 10.0):
                                 return link
                     uri = (link.get("uri") or "").strip().lower()
-                    if uri and len(uri) >= 6 and (norm in uri or uri in norm):
+                    if uri and len(uri) >= 6 and len(norm) >= 4 and (norm in uri or uri in norm):
                         return link
         return None
 

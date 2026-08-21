@@ -158,8 +158,22 @@ class OpenDataLoaderAdapter:
                 page_h = float(fitz_page.rect.height)
                 raw_page_text = fitz_page.get_text().strip()
                 
-                # Check for Table of Contents page
+                # Check for specialized pages
                 is_toc_page = self.layout_detector._is_table_of_contents_page(raw_page_text, p_idx)
+                is_ref_page = self.layout_detector._is_reference_page(raw_page_text, p_idx, total_pdf_pages)
+                is_idx_page = self.layout_detector._is_index_page(raw_page_text, p_idx, total_pdf_pages)
+                is_cip_page = (p_idx <= 5 and self.layout_detector._is_copyright_page(raw_page_text))
+                
+                page_dict = fitz_page.get_text("dict")
+                text_blocks = [b for b in page_dict.get("blocks", []) if b.get("type") == 0]
+                
+                is_front_matter = False
+                if p_idx == 0 and not text_blocks:
+                    is_front_matter = True  # Cover page
+                elif p_idx == 1 and self.layout_detector._is_half_title_page(raw_page_text, text_blocks):
+                    is_front_matter = True  # Half-title page
+                elif (p_idx == 2 or (p_idx <= 3 and self.layout_detector._is_title_page(raw_page_text, text_blocks))) and not is_cip_page:
+                    is_front_matter = True  # Title page
                 
                 elements: List[SemanticElement] = []
                 reading_order_ids: List[str] = []
@@ -169,6 +183,66 @@ class OpenDataLoaderAdapter:
                     elements = self.layout_detector._extract_toc_page_elements(
                         page_dict, p_idx, page_h, 10.5, 0
                     )
+                elif is_cip_page:
+                    # Copyright / CIP page
+                    graphic_figures, graphic_artifacts = self.layout_detector._extract_page_graphics(
+                        fitz_page, p_idx, page_w, page_h, text_blocks, ""
+                    )
+                    cip_elements = self.layout_detector._extract_copyright_page_elements(
+                        page_dict, p_idx, page_h, page_w, 10.5, 0, total_pdf_pages
+                    )
+                    top_fig = [f for f in graphic_figures if f.bbox.y0 < 100]
+                    mid_figs = [f for f in graphic_figures if f.bbox.y0 >= 100]
+                    mid_figs.sort(key=lambda f: f.bbox.x0, reverse=True)
+                    first_p = [el for el in cip_elements if not el.is_artifact][:1]
+                    rest_ps = [el for el in cip_elements if not el.is_artifact][1:]
+                    cip_arts = [el for el in cip_elements if el.is_artifact]
+                    
+                    elements = top_fig + first_p + mid_figs + rest_ps + graphic_artifacts + cip_arts
+                    for idx, el in enumerate(elements):
+                        el.reading_order_index = idx
+                elif is_ref_page:
+                    # References / Bibliography page
+                    font_profiles = self.layout_detector._profile_document_fonts(doc)
+                    body_font_size = font_profiles.get("body_font_size", 10.5)
+                    elements = self.layout_detector._extract_reference_page_elements(
+                        page_dict, p_idx, page_h, page_w, body_font_size, 0, total_pdf_pages
+                    )
+                elif is_idx_page:
+                    # Index page
+                    font_profiles = self.layout_detector._profile_document_fonts(doc)
+                    body_font_size = font_profiles.get("body_font_size", 10.5)
+                    elements = self.layout_detector._extract_index_page_elements(
+                        page_dict, p_idx, page_h, page_w, body_font_size, 0, total_pdf_pages
+                    )
+                elif is_front_matter:
+                    # Use native layout detector for front matter pages
+                    # which have specialized handlers for cover, half-title, title
+                    font_profiles = self.layout_detector._profile_document_fonts(doc)
+                    body_font_size = font_profiles.get("body_font_size", 10.5)
+                    doc_title = ""
+                    elem_counter = 0
+                    
+                    # Extract graphics first
+                    graphic_figures, graphic_artifacts = self.layout_detector._extract_page_graphics(
+                        fitz_page, p_idx, page_w, page_h, text_blocks, doc_title
+                    )
+                    elements.extend(graphic_figures)
+                    elements.extend(graphic_artifacts)
+                    elem_counter = len(elements)
+                    
+                    if p_idx == 0 and not text_blocks:
+                        pass  # Cover page - graphics already handled
+                    elif p_idx == 1:
+                        ht_elements = self.layout_detector._extract_half_title_elements(
+                            page_dict, p_idx, page_h, elem_counter
+                        )
+                        elements.extend(ht_elements)
+                    elif p_idx <= 3:
+                        title_elements = self.layout_detector._extract_title_page_elements(
+                            page_dict, p_idx, page_h, body_font_size, elem_counter, doc_title
+                        )
+                        elements.extend(title_elements)
                 else:
                     page_kids = kids_by_page.get(p_idx, [])
                     for k_idx, kid in enumerate(page_kids):
@@ -179,7 +253,14 @@ class OpenDataLoaderAdapter:
                         else:
                             el = self._convert_kid_to_element(kid, p_idx, k_idx, page_w, page_h)
                             if el:
-                                elements.append(el)
+                                if p_idx <= 3:
+                                    list_pair = self._try_split_list_element(el, p_idx, k_idx)
+                                    if list_pair:
+                                        elements.extend(list_pair)
+                                    else:
+                                        elements.append(el)
+                                else:
+                                    elements.append(el)
 
                     # Complement with native TableExtractor if no table was found by ODL
                     if not any(el.tag == StandardTag.TABLE for el in elements):
@@ -293,8 +374,17 @@ class OpenDataLoaderAdapter:
             tag = self.TYPE_MAP.get(elem_type_lower, StandardTag.P)
 
         if elem_type_lower == "heading" and "heading level" in kid:
-            lvl = min(6, max(1, kid["heading level"]))
-            tag = getattr(StandardTag, f"H{lvl}")
+            raw_lvl = kid["heading level"]
+            if page_idx > 2:
+                if raw_lvl <= 1:
+                    tag = StandardTag.H2
+                elif raw_lvl == 2:
+                    tag = StandardTag.H3
+                else:
+                    tag = StandardTag.H4
+            else:
+                lvl = min(4, max(1, raw_lvl))
+                tag = getattr(StandardTag, f"H{lvl}")
 
         # Convert OpenDataLoader bottom-up coordinates to standard top-down coordinates:
         # OpenDataLoader: [x0, y0_bottom, x1, y1_top]
@@ -326,6 +416,25 @@ class OpenDataLoaderAdapter:
             return None
 
         text_content = kid.get("content") or kid.get("text") or ""
+        if not text_content and "kids" in kid:
+            text_content = "".join(str(sub.get("content") or sub.get("text") or "") for sub in kid.get("kids", []) or []).strip()
+        text_content = text_content.strip()
+
+        # Validate caption: only true Table/Figure captions should be CAPTION, otherwise P
+        if tag == StandardTag.CAPTION or elem_type_lower == "caption" or pdfua_tag == "Caption":
+            if self.layout_detector.caption_regex.match(text_content):
+                tag = StandardTag.CAPTION
+            else:
+                tag = StandardTag.P
+        # Chapter headings are always H2
+        if tag in (StandardTag.H2, StandardTag.H3, StandardTag.H4, StandardTag.H5, StandardTag.H6) or elem_type_lower == "heading":
+            if self.layout_detector.chapter_regex.match(text_content) or re.match(r'^CHAPTER\s+\d+', text_content, re.IGNORECASE):
+                tag = StandardTag.H2
+
+        actual_text = None
+        if page_idx == 3 and "©" in text_content:
+            actual_text = text_content.strip()
+
         is_artifact = (tag == StandardTag.ARTIFACT or elem_type.lower() in ("header", "footer"))
         artifact_type = "Header" if elem_type.lower() == "header" else ("Footer" if elem_type.lower() == "footer" else None)
 
@@ -403,6 +512,7 @@ class OpenDataLoaderAdapter:
             reading_order_index=k_idx,
             bbox=bbox,
             text=text_content,
+            actual_text=actual_text,
             font_name=kid.get("font"),
             font_size=kid.get("font size"),
             font_weight="bold" if kid.get("is_bold") else "normal",
@@ -520,6 +630,120 @@ class OpenDataLoaderAdapter:
                     el.alt_text = gen.generate_alt_text(el, elements, None)
         except Exception:
             pass
+
+    def _try_split_list_element(self, el: SemanticElement, page_idx: int, k_idx: int) -> Optional[List[SemanticElement]]:
+        """Splits a paragraph that begins with bullet or numbered list markers
+        into <Lbl> + <LBody> element pairs, including multi-item lines."""
+        if el.tag != StandardTag.P or not el.text:
+            return None
+        text = el.text.strip()
+        
+        multi_list_split_re = re.compile(
+            r'(?:^|[\s\u00a0\u2002\u2003\u2009]+)((?:[0-9]+|[ivxlcdm]{1,4})[\.\:\)]|\([a-z0-9ivx]+\))[\s\u00a0\u2002\u2003\u2009]+',
+            re.IGNORECASE
+        )
+        matches = list(multi_list_split_re.finditer(text))
+        
+        if len(matches) >= 2:
+            elements: List[SemanticElement] = []
+            font_size = el.font_size or 10.0
+            total_w = el.bbox.width
+            item_w = total_w / len(matches)
+            for i, m in enumerate(matches):
+                lbl = m.group(1)
+                start_idx = m.end()
+                end_idx = matches[i + 1].start() if i + 1 < len(matches) else len(text)
+                body = text[start_idx:end_idx].strip()
+                is_roman = bool(re.match(r'^[ivxlcdm]+[\.\:\)]', lbl, re.IGNORECASE))
+                lvl = 1 if is_roman else 0
+
+                item_x0 = el.bbox.x0 + i * item_w
+                item_x1 = item_x0 + item_w
+                lbl_w = max(10.0, font_size * 0.9, len(lbl) * font_size * 0.55)
+
+                lbl_bbox = BoundingBox(x0=item_x0, y0=el.bbox.y0, x1=min(item_x1, item_x0 + lbl_w), y1=el.bbox.y1)
+                body_bbox = BoundingBox(x0=min(item_x1, item_x0 + lbl_w), y0=el.bbox.y0, x1=item_x1, y1=el.bbox.y1)
+
+                elements.append(SemanticElement(
+                    id=f"{el.id}_lbl_{i}",
+                    tag=StandardTag.LBL,
+                    page_num=page_idx,
+                    reading_order_index=el.reading_order_index,
+                    bbox=lbl_bbox,
+                    text=lbl,
+                    list_label=lbl,
+                    list_level=lvl,
+                    font_size=font_size
+                ))
+                elements.append(SemanticElement(
+                    id=f"{el.id}_lbody_{i}",
+                    tag=StandardTag.LBODY,
+                    page_num=page_idx,
+                    reading_order_index=el.reading_order_index,
+                    bbox=body_bbox,
+                    text=body,
+                    list_label=lbl,
+                    list_level=lvl,
+                    font_size=font_size
+                ))
+            return elements
+
+        b_match = self.layout_detector.bullet_regex.match(text)
+        n_match = self.layout_detector.numbered_list_regex.match(text)
+        if not (b_match or n_match):
+            return None
+
+        if b_match:
+            label_str = text[0]
+            body_text = (b_match.group(1) or "").strip()
+            list_level = 0
+        else:
+            label_str = n_match.group(1)
+            body_text = (n_match.group(2) or "").strip()
+            is_roman = bool(re.match(r'^[ivxlcdm]+[\.\:\)]', label_str, re.IGNORECASE))
+            list_level = 1 if is_roman else 0
+
+        if not body_text:
+            return None
+
+        font_size = el.font_size or 10.0
+        label_width = max(10.0, font_size * 0.9, len(label_str) * font_size * 0.55)
+        lbl_bbox = BoundingBox(
+            x0=el.bbox.x0,
+            y0=el.bbox.y0,
+            x1=min(el.bbox.x1, el.bbox.x0 + label_width),
+            y1=el.bbox.y1
+        )
+        body_bbox = BoundingBox(
+            x0=min(el.bbox.x1, el.bbox.x0 + label_width),
+            y0=el.bbox.y0,
+            x1=el.bbox.x1,
+            y1=el.bbox.y1
+        )
+
+        lbl_el = SemanticElement(
+            id=f"{el.id}_lbl",
+            tag=StandardTag.LBL,
+            page_num=page_idx,
+            reading_order_index=el.reading_order_index,
+            bbox=lbl_bbox,
+            text=label_str,
+            list_label=label_str,
+            list_level=list_level,
+            font_size=font_size
+        )
+        lbody_el = SemanticElement(
+            id=f"{el.id}_lbody",
+            tag=StandardTag.LBODY,
+            page_num=page_idx,
+            reading_order_index=el.reading_order_index,
+            bbox=body_bbox,
+            text=body_text,
+            list_label=label_str,
+            list_level=list_level,
+            font_size=font_size
+        )
+        return [lbl_el, lbody_el]
 
     def _normalize_heading_levels(self, elements: List[SemanticElement]):
         """Normalizes heading hierarchy to eliminate skipped levels."""

@@ -16,7 +16,9 @@ from src.engine.layout_detector import LayoutDetector
 from src.engine.opendataloader_adapter import OpenDataLoaderAdapter
 from src.engine.tagger import PDFTagger
 from src.engine.validator import AccessibilityValidator
+from src.engine.index_fixer import fix_index_pages
 from src.engine.logger import logger, Verbosity
+from src.engine.models import StandardTag
 
 
 class AutoTaggingEngine:
@@ -130,6 +132,33 @@ class AutoTaggingEngine:
             p3_dur = logger.stop_timer("p3")
             total_mcids = sum(p.total_mcids for p in pages_layout)
             logger.success(f"Phase 3 complete in {p3_dur:.3f}s (Injected {total_mcids} marked content sequences)")
+
+            # Phase 3b: Index Page Tag Post-Processing
+            # Detect index pages from layout analysis and fix /P tag splitting
+            # using hanging-indent detection from the content stream.
+            index_page_indices = []
+            for p_layout in pages_layout:
+                has_index_heading = any(
+                    "INDEX" in el.text.upper() and el.tag in (StandardTag.H2, StandardTag.H3, StandardTag.H4)
+                    for el in p_layout.elements if not el.is_artifact
+                )
+                is_late_page = p_layout.page_num >= len(pages_layout) * 0.85
+                if has_index_heading and is_late_page:
+                    # This page and following pages are likely index pages
+                    for idx in range(p_layout.page_num, len(pages_layout)):
+                        if idx not in index_page_indices:
+                            index_page_indices.append(idx)
+                    break
+
+            if index_page_indices:
+                logger.phase("Phase 3b: Index Page Tag Re-splitting")
+                logger.start_timer("p3b")
+                try:
+                    fix_index_pages(final_output_path, final_output_path, index_page_indices)
+                except Exception as e:
+                    logger.debug(f"Index page fix skipped: {str(e)}", "INDEX_FIX")
+                p3b_dur = logger.stop_timer("p3b")
+                logger.success(f"Phase 3b complete in {p3b_dur:.3f}s (Fixed {len(index_page_indices)} index pages)")
 
             # Phase 4: Compliance Auditing (PDF/UA-1 & WCAG 2.1/2.2 AA)
             logger.phase("Phase 4: PDF/UA & WCAG Compliance Validation")
